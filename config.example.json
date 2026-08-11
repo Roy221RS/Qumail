@@ -1,0 +1,9 @@
+{
+  "user_name": "",
+  "email_address": "",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 465,
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "app_password": ""
+}

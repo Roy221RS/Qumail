@@ -31,7 +31,7 @@ from email.message import EmailMessage as MimeEmailMessage
 from email.header import decode_header
 from typing import Optional, List, Dict, Any
 
-from crypto_adapter import CryptoAdapter
+from cryptoAdapter import CryptoAdapter
 
 HEADER_LEVEL = "X-QuMail-Level"
 HEADER_KEYID = "X-QuMail-KeyID"

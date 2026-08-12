@@ -21,3 +21,5 @@ keys/
 Thumbs.db
 
 pass.txt
+
+src/config.json

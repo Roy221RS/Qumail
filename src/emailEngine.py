@@ -26,6 +26,8 @@ import smtplib
 import imaplib
 import email
 import os
+import re
+import html as html_module
 from dataclasses import dataclass, field
 from email.message import EmailMessage as MimeEmailMessage
 from email.header import decode_header
@@ -38,6 +40,15 @@ HEADER_KEYID = "X-QuMail-KeyID"
 
 
 @dataclass
+class EmailAttachment:
+    """A single attachment's filename and raw bytes, extracted during
+    fetch_inbox() so it can be saved to disk without re-fetching the
+    whole email from the server."""
+    filename: str
+    data: bytes
+
+
+@dataclass
 class EmailMessage:
     """Structured representation of a fetched email, for GUI consumption."""
     uid: str
@@ -47,7 +58,7 @@ class EmailMessage:
     body: str
     security_level: int = 1
     key_id: Optional[str] = None
-    attachments: List[str] = field(default_factory=list)  # filenames only, Phase 1
+    attachments: List[EmailAttachment] = field(default_factory=list)
 
 
 def _decode_mime_words(s: str) -> str:
@@ -63,6 +74,39 @@ def _decode_mime_words(s: str) -> str:
         else:
             decoded += text
     return decoded
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_STYLE_SCRIPT_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_MULTI_BLANK_RE = re.compile(r"\n{3,}")
+# Matches both closing block tags (</p>, </div>...) AND self-closing/void
+# tags like <br>, <br/>, <br /> which never have a closing counterpart.
+_BLOCK_BREAK_RE = re.compile(
+    r"</(p|div|tr|table|li|h[1-6])\s*>|<br\s*/?>", re.IGNORECASE
+)
+
+
+def _html_to_text(html_body: str) -> str:
+    """
+    Very lightweight HTML -> plain text conversion for display in the
+    reading pane. This is NOT a full HTML renderer (Phase 1 doesn't need
+    one) - it just strips tags so the user sees readable text instead of
+    raw markup, which is what was happening for HTML-only emails before
+    this fix.
+
+    Good enough for: newsletters, automated mail, HTML-composed messages.
+    Not attempting: images, tables, links-as-clickable, styling.
+    """
+    if not html_body:
+        return ""
+
+    text = _STYLE_SCRIPT_RE.sub("", html_body)  # drop <style>/<script> contents entirely
+    text = _BLOCK_BREAK_RE.sub("\n", text)      # turn block-level closes + <br> into line breaks
+    text = _TAG_RE.sub("", text)                # strip all remaining tags
+    text = html_module.unescape(text)           # decode entities like &amp; &nbsp;
+    text = text.replace("\xa0", " ")            # normalize non-breaking spaces to regular ones
+    text = _MULTI_BLANK_RE.sub("\n\n", text)    # collapse excess blank lines
+    return text.strip()
 
 
 def send_email(
@@ -181,6 +225,7 @@ def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessa
             key_id = parsed.get(HEADER_KEYID) or None
 
             body = ""
+            html_fallback = ""  # used only if no text/plain part exists
             attachments = []
 
             if parsed.is_multipart():
@@ -191,7 +236,15 @@ def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessa
                     if "attachment" in content_disposition:
                         filename = part.get_filename()
                         if filename:
-                            attachments.append(_decode_mime_words(filename))
+                            try:
+                                data = part.get_payload(decode=True) or b""
+                            except Exception:
+                                data = b""
+                            attachments.append(
+                                EmailAttachment(
+                                    filename=_decode_mime_words(filename), data=data
+                                )
+                            )
                     elif content_type == "text/plain" and not body:
                         try:
                             body = part.get_payload(decode=True).decode(
@@ -200,14 +253,35 @@ def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessa
                             )
                         except Exception:
                             body = "[Could not decode message body]"
+                    elif content_type == "text/html" and not html_fallback:
+                        # Many emails (esp. multipart/alternative) only ship
+                        # an HTML version. Keep it as a fallback in case no
+                        # text/plain part turns up anywhere in the tree.
+                        try:
+                            html_fallback = part.get_payload(decode=True).decode(
+                                part.get_content_charset() or "utf-8",
+                                errors="replace",
+                            )
+                        except Exception:
+                            pass
+
+                if not body and html_fallback:
+                    body = _html_to_text(html_fallback)
             else:
+                content_type = parsed.get_content_type()
                 try:
                     payload = parsed.get_payload(decode=True)
-                    body = payload.decode(
+                    raw = payload.decode(
                         parsed.get_content_charset() or "utf-8", errors="replace"
                     ) if payload else ""
                 except Exception:
+                    raw = ""
                     body = "[Could not decode message body]"
+                else:
+                    # This is the actual bug fix: single-part HTML emails
+                    # were being dumped as raw markup before. Now we check
+                    # content_type before deciding whether to convert.
+                    body = _html_to_text(raw) if content_type == "text/html" else raw
 
             # Phase 1: body is never actually decrypted (level 1 only exists).
             # Phase 2 TODO: if security_level > 1, call

@@ -34,7 +34,7 @@ from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
 
 from config import Config
-from emailEngine import send_email, fetch_inbox, EmailMessage
+from emailEngine import send_email, fetch_inbox, EmailMessage, EmailAttachment
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -272,7 +272,6 @@ class QuMailApp(ctk.CTk):
     def _build_inbox_view(self, parent) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(2, weight=1)
 
         header_row = ctk.CTkFrame(frame, fg_color="transparent")
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -310,10 +309,15 @@ class QuMailApp(ctk.CTk):
         # keep parsed EmailMessage objects indexed by Treeview item id
         self._inbox_items: dict[str, EmailMessage] = {}
 
+        # --- Attachments strip (Save button per attachment, populated on select) ---
+        self.attachments_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        self.attachments_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+
         # --- Reading pane ---
         self.reading_pane = ctk.CTkTextbox(frame)
-        self.reading_pane.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        self.reading_pane.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         self.reading_pane.configure(state="disabled")
+        frame.grid_rowconfigure(3, weight=1)
 
         return frame
 
@@ -375,14 +379,56 @@ class QuMailApp(ctk.CTk):
         if not msg:
             return
 
+        # --- rebuild attachments strip for this email ---
+        for child in self.attachments_frame.winfo_children():
+            child.destroy()
+
+        if msg.attachments:
+            ctk.CTkLabel(
+                self.attachments_frame, text="Attachments:", text_color="gray60"
+            ).pack(side="left", padx=(0, 8))
+            for att in msg.attachments:
+                self._add_attachment_chip(att)
+
+        # --- reading pane: header + body only, no attachment names inline ---
         self.reading_pane.configure(state="normal")
         self.reading_pane.delete("1.0", "end")
         header = f"From: {msg.sender}\nSubject: {msg.subject}\nDate: {msg.date}\n"
-        if msg.attachments:
-            header += f"Attachments: {', '.join(msg.attachments)}\n"
         header += "\n" + "-" * 60 + "\n\n"
         self.reading_pane.insert("1.0", header + msg.body)
         self.reading_pane.configure(state="disabled")
+
+    def _add_attachment_chip(self, att: EmailAttachment):
+        """One small pill per attachment: filename + Save button."""
+        chip = ctk.CTkFrame(self.attachments_frame, fg_color="#2b2b2b")
+        chip.pack(side="left", padx=4)
+        ctk.CTkLabel(chip, text=att.filename, font=ctk.CTkFont(size=12)).pack(
+            side="left", padx=(10, 6), pady=4
+        )
+        ctk.CTkButton(
+            chip, text="Save", width=54, height=24,
+            command=lambda a=att: self._save_attachment(a),
+        ).pack(side="left", padx=(0, 6), pady=4)
+
+    def _save_attachment(self, att: EmailAttachment):
+        if not att.data:
+            messagebox.showwarning(
+                "Empty attachment", f"'{att.filename}' has no data to save."
+            )
+            return
+        dest = filedialog.asksaveasfilename(
+            initialfile=att.filename,
+            title="Save attachment as",
+        )
+        if not dest:
+            return
+        try:
+            with open(dest, "wb") as f:
+                f.write(att.data)
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e))
+        else:
+            messagebox.showinfo("Saved", f"Saved to {dest}")
 
     # ------------------------------------------------------------------ #
     # Settings view

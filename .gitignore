@@ -22,4 +22,6 @@ Thumbs.db
 
 pass.txt
 
-src/config.json
+config.json
+
+key_bank.json

@@ -35,6 +35,7 @@ import customtkinter as ctk
 
 from config import Config
 from emailEngine import send_email, fetch_inbox, EmailMessage, EmailAttachment
+from kmAdapter import MockKMAdapter
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -54,6 +55,7 @@ class QuMailApp(ctk.CTk):
         self.geometry("1100x680")
 
         self.config_mgr = Config()
+        self.km_adapter = MockKMAdapter()
 
         # Queues for background-thread -> main-thread communication.
         # One per operation type keeps polling logic simple.
@@ -116,25 +118,46 @@ class QuMailApp(ctk.CTk):
                 command=lambda v=view: self._show_view(v),
             ).pack(fill="x", padx=16, pady=6)
 
-        # --- QKD Key Bank Status placeholder (Phase 2 wires this up) ---
+        # --- QKD Key Bank Status - now wired to real km_adapter.py data ---
         key_bank_frame = ctk.CTkFrame(sidebar)
         key_bank_frame.pack(side="bottom", fill="x", padx=16, pady=20)
 
         ctk.CTkLabel(
             key_bank_frame, text="Local Key Manager", font=ctk.CTkFont(size=12, weight="bold")
         ).pack(anchor="w", padx=10, pady=(10, 2))
-        ctk.CTkLabel(
-            key_bank_frame, text="Status: Standby", text_color="gray60", font=ctk.CTkFont(size=11)
-        ).pack(anchor="w", padx=10)
+        self.key_bank_status_label = ctk.CTkLabel(
+            key_bank_frame, text="Status: Ready", text_color="gray60", font=ctk.CTkFont(size=11)
+        )
+        self.key_bank_status_label.pack(anchor="w", padx=10)
 
         self.key_bank_progress = ctk.CTkProgressBar(key_bank_frame)
         self.key_bank_progress.pack(fill="x", padx=10, pady=(8, 2))
-        self.key_bank_progress.set(1.0)  # 100/100 keys, hardcoded until Phase 2
 
-        ctk.CTkLabel(
-            key_bank_frame, text="100 / 100 Keys Available", font=ctk.CTkFont(size=11),
-            text_color="gray60",
-        ).pack(anchor="w", padx=10, pady=(0, 10))
+        self.key_bank_count_label = ctk.CTkLabel(
+            key_bank_frame, text="", font=ctk.CTkFont(size=11), text_color="gray60",
+        )
+        self.key_bank_count_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+        self._refresh_key_bank_widget()  # populate with real numbers immediately
+
+    def _refresh_key_bank_widget(self):
+        """Pull real numbers from km_adapter and update the sidebar widget.
+        Call this after any operation that consumes a key (currently none
+        do yet, since crypto Phase 2 hasn't landed - but Settings/Send will
+        call this once L2/L3 actually fetch keys)."""
+        status = self.km_adapter.get_status()
+        total = status["total_keys"]
+        available = status["available_keys"]
+
+        self.key_bank_progress.set(available / total if total else 0)
+        self.key_bank_count_label.configure(text=f"{available} / {total} Keys Available")
+
+        if available == 0:
+            self.key_bank_status_label.configure(text="Status: Exhausted", text_color="red")
+        elif available < total * 0.2:
+            self.key_bank_status_label.configure(text="Status: Low", text_color="orange")
+        else:
+            self.key_bank_status_label.configure(text="Status: Ready", text_color="gray60")
 
     def _show_view(self, name: str):
         self.views[name].tkraise()

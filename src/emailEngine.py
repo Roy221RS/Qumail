@@ -2,8 +2,11 @@
 email_engine.py
 
 Core protocol engine for QuMail:
-- send_email(): builds a MIME message and sends over SMTP+SSL
-- fetch_inbox(): pulls recent messages over IMAP+SSL, parses headers/body
+- send_email(): builds a MIME message, encrypts the body if security_level
+  > 1 (fetching a key from km_adapter), and sends over SMTP+SSL
+- fetch_inbox(): pulls recent messages over IMAP+SSL, parses headers/body,
+  and decrypts the body if the message was sent at security_level > 1
+  (fetching the matching key from km_adapter by key_id)
 
 Both functions are synchronous / blocking on purpose — the GUI layer is
 responsible for running these on a background thread (see gui_app.py) and
@@ -11,15 +14,15 @@ must NEVER touch CTk widgets directly from that thread. Push results into
 a queue.Queue and poll it from the main thread via .after().
 
 Security metadata:
-QuMail attaches two custom headers so the receiver knows how a message was
+QuMail attaches custom headers so the receiver knows how a message was
 protected and which quantum key to re-fetch from its own local KM:
     X-QuMail-Level   -> "1" | "2" | "3"
     X-QuMail-KeyID   -> key identifier string, or "" for Level 1
+    X-QuMail-Nonce   -> base64 AES-GCM nonce, only present for Level 2
 
-In Phase 1, CryptoAdapter is a passthrough (Level 1 only), so these headers
-are always ("1", "") - but fetch_inbox parses them now so the Inbox UI's
-status-tag column is driven by real header data from day one, instead of
-being hardcoded and needing rework in Phase 2.
+For Level 1, all of this is a no-op passthrough (headers are "1"/""/absent).
+For Level 2+, send_email requires a km_adapter to allocate a key, and
+fetch_inbox requires one to look the same key back up by ID.
 """
 
 import smtplib
@@ -27,6 +30,7 @@ import imaplib
 import email
 import os
 import re
+import base64
 import html as html_module
 from dataclasses import dataclass, field
 from email.message import EmailMessage as MimeEmailMessage
@@ -34,9 +38,11 @@ from email.header import decode_header
 from typing import Optional, List, Dict, Any
 
 from cryptoAdapter import CryptoAdapter
+from kmAdapter import KMAdapter
 
 HEADER_LEVEL = "X-QuMail-Level"
 HEADER_KEYID = "X-QuMail-KeyID"
+HEADER_NONCE = "X-QuMail-Nonce"
 
 
 @dataclass
@@ -117,6 +123,7 @@ def send_email(
     attachment_paths: Optional[List[str]] = None,
     security_level: int = 1,
     metadata: Optional[Dict[str, Any]] = None,
+    km_adapter: Optional[KMAdapter] = None,
 ) -> None:
     """
     Send an email over SMTP+SSL.
@@ -124,10 +131,15 @@ def send_email(
     config: dict from Config.data (needs email_address, smtp_host, smtp_port,
             app_password, user_name)
     security_level: 1, 2, or 3 - passed to CryptoAdapter to process the body
-            (and in future, attachments) before sending
-    metadata: optional dict passed through to CryptoAdapter.encrypt_payload,
-            e.g. {"key_material": ..., "key_id": ...} once Phase 2 lands
+            before sending
+    metadata: optional override, e.g. {"key_material": ..., "key_id": ...}
+            to force a specific key instead of allocating a fresh one -
+            mainly useful for tests. Normal usage leaves this None and lets
+            km_adapter allocate a fresh key automatically.
+    km_adapter: REQUIRED if security_level > 1. Used to allocate a fresh
+            quantum key to encrypt this message with.
 
+    Raises ValueError if security_level > 1 and no km_adapter was given.
     Raises smtplib/OSError exceptions on failure - caller (GUI thread
     wrapper) is responsible for catching these and surfacing a toast/error,
     never let this crash the background thread silently.
@@ -135,12 +147,23 @@ def send_email(
     attachment_paths = attachment_paths or []
     metadata = metadata or {}
 
+    key_material = metadata.get("key_material")
+    key_id = metadata.get("key_id")
+
+    if security_level > 1 and key_material is None:
+        if km_adapter is None:
+            raise ValueError(
+                f"security_level={security_level} requires a km_adapter to fetch a key."
+            )
+        # Sender side: allocate a fresh, previously-unused key.
+        key_material, key_id = km_adapter.get_key()
+
     adapter = CryptoAdapter()
     processed_body_bytes, crypto_meta = adapter.encrypt_payload(
         body.encode("utf-8"),
         level=security_level,
-        key_material=metadata.get("key_material"),
-        key_id=metadata.get("key_id"),
+        key_material=key_material,
+        key_id=key_id,
     )
 
     msg = MimeEmailMessage()
@@ -149,17 +172,16 @@ def send_email(
     msg["Subject"] = subject
     msg[HEADER_LEVEL] = str(crypto_meta.get("level", security_level))
     msg[HEADER_KEYID] = crypto_meta.get("key_id") or ""
+    if crypto_meta.get("nonce"):
+        msg[HEADER_NONCE] = crypto_meta["nonce"]
 
-    # Phase 1: level 1 is a passthrough, so this is just the plaintext body.
-    # Phase 2: processed_body_bytes may be ciphertext - set_content still
-    # works since we treat it as a byte payload either way, but real Phase 2
-    # code should base64 or otherwise encode non-UTF8-safe bytes before
-    # calling set_content with a text subtype.
-    try:
+    if security_level == 1:
+        # Plaintext body - human readable, no special encoding needed.
         msg.set_content(processed_body_bytes.decode("utf-8"))
-    except UnicodeDecodeError:
-        # ciphertext isn't valid utf-8 text - Phase 2 concern, base64-encode
-        import base64
+    else:
+        # Ciphertext is arbitrary bytes, not valid text - base64-encode it
+        # explicitly (not left to chance/exceptions) so fetch_inbox can
+        # reliably get the raw bytes back via get_payload(decode=True).
         msg.set_content(base64.b64encode(processed_body_bytes).decode("ascii"))
         msg.replace_header("Content-Transfer-Encoding", "base64")
 
@@ -169,9 +191,9 @@ def send_email(
         filename = os.path.basename(path)
         with open(path, "rb") as f:
             data = f.read()
-        # Phase 1: attachments are NOT run through the crypto adapter yet.
-        # Phase 2 TODO: encrypt attachment bytes the same way as the body
-        # before attaching, and record that in crypto_meta / headers.
+        # Phase 2 TODO: attachments are NOT run through the crypto adapter
+        # yet - only the body is encrypted so far. Encrypting attachment
+        # bytes the same way is the next piece of work, not yet done here.
         msg.add_attachment(
             data,
             maintype="application",
@@ -184,14 +206,24 @@ def send_email(
         server.send_message(msg)
 
 
-def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessage]:
+def fetch_inbox(
+    config: Dict[str, Any],
+    max_emails: int = 15,
+    km_adapter: Optional[KMAdapter] = None,
+) -> List[EmailMessage]:
     """
     Fetch the most recent `max_emails` messages from the inbox via IMAP+SSL.
+
+    km_adapter: needed to decrypt any Level 2+ message found in the inbox.
+            If None, encrypted messages are still listed (sender/subject/
+            date all work) but the body shows a placeholder instead of
+            attempting decryption.
 
     Returns a list of EmailMessage, most recent first.
     Raises imaplib.IMAP4.error / OSError on connection/auth failure.
     """
     results: List[EmailMessage] = []
+    crypto = CryptoAdapter()
 
     with imaplib.IMAP4_SSL(config["imap_host"], int(config["imap_port"])) as imap:
         imap.login(config["email_address"], config["app_password"])
@@ -223,10 +255,22 @@ def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessa
             except (TypeError, ValueError):
                 security_level = 1
             key_id = parsed.get(HEADER_KEYID) or None
+            nonce_b64 = parsed.get(HEADER_NONCE) or None
 
-            body = ""
-            html_fallback = ""  # used only if no text/plain part exists
             attachments = []
+
+            # First pass: collect attachments, and grab the RAW bytes of the
+            # main body part - deliberately NOT charset-decoded yet. For an
+            # encrypted message these raw bytes (after get_payload(decode=True)
+            # strips the base64 Content-Transfer-Encoding) are the actual
+            # ciphertext; for a plaintext message they're just the plain
+            # text/html bytes, decoded further below.
+            body_raw_bytes = b""
+            body_is_html = False
+            body_charset = "utf-8"
+            html_fallback_bytes = b""
+            html_charset = "utf-8"
+            found_plain = False
 
             if parsed.is_multipart():
                 for part in parsed.walk():
@@ -237,56 +281,74 @@ def fetch_inbox(config: Dict[str, Any], max_emails: int = 15) -> List[EmailMessa
                         filename = part.get_filename()
                         if filename:
                             try:
-                                data = part.get_payload(decode=True) or b""
+                                att_data = part.get_payload(decode=True) or b""
                             except Exception:
-                                data = b""
+                                att_data = b""
                             attachments.append(
                                 EmailAttachment(
-                                    filename=_decode_mime_words(filename), data=data
+                                    filename=_decode_mime_words(filename), data=att_data
                                 )
                             )
-                    elif content_type == "text/plain" and not body:
+                    elif content_type == "text/plain" and not found_plain:
                         try:
-                            body = part.get_payload(decode=True).decode(
-                                part.get_content_charset() or "utf-8",
-                                errors="replace",
-                            )
+                            body_raw_bytes = part.get_payload(decode=True) or b""
+                            body_charset = part.get_content_charset() or "utf-8"
+                            found_plain = True
                         except Exception:
-                            body = "[Could not decode message body]"
-                    elif content_type == "text/html" and not html_fallback:
-                        # Many emails (esp. multipart/alternative) only ship
-                        # an HTML version. Keep it as a fallback in case no
-                        # text/plain part turns up anywhere in the tree.
+                            body_raw_bytes = b""
+                    elif content_type == "text/html" and not html_fallback_bytes:
                         try:
-                            html_fallback = part.get_payload(decode=True).decode(
-                                part.get_content_charset() or "utf-8",
-                                errors="replace",
-                            )
+                            html_fallback_bytes = part.get_payload(decode=True) or b""
+                            html_charset = part.get_content_charset() or "utf-8"
                         except Exception:
                             pass
 
-                if not body and html_fallback:
-                    body = _html_to_text(html_fallback)
+                if not found_plain and html_fallback_bytes:
+                    body_raw_bytes = html_fallback_bytes
+                    body_charset = html_charset
+                    body_is_html = True
             else:
                 content_type = parsed.get_content_type()
                 try:
-                    payload = parsed.get_payload(decode=True)
-                    raw = payload.decode(
-                        parsed.get_content_charset() or "utf-8", errors="replace"
-                    ) if payload else ""
+                    body_raw_bytes = parsed.get_payload(decode=True) or b""
                 except Exception:
-                    raw = ""
-                    body = "[Could not decode message body]"
-                else:
-                    # This is the actual bug fix: single-part HTML emails
-                    # were being dumped as raw markup before. Now we check
-                    # content_type before deciding whether to convert.
-                    body = _html_to_text(raw) if content_type == "text/html" else raw
+                    body_raw_bytes = b""
+                body_charset = parsed.get_content_charset() or "utf-8"
+                body_is_html = content_type == "text/html"
 
-            # Phase 1: body is never actually decrypted (level 1 only exists).
-            # Phase 2 TODO: if security_level > 1, call
-            # CryptoAdapter.decrypt_payload(body_bytes, {"level":..., "key_id":...})
-            # after fetching key_id's key material from KMAdapter.
+            # Second pass: turn body_raw_bytes into the final display string.
+            # This is the branch point between "just show me the text" (L1)
+            # and "decrypt this first" (L2/L3).
+            if security_level == 1:
+                try:
+                    raw_text = body_raw_bytes.decode(body_charset, errors="replace")
+                except Exception:
+                    raw_text = ""
+                body = _html_to_text(raw_text) if body_is_html else raw_text
+
+            else:
+                if km_adapter is None:
+                    body = (
+                        f"[Encrypted message - Level {security_level} - "
+                        "no key manager available to decrypt]"
+                    )
+                elif not key_id:
+                    body = "[Encrypted message - missing key ID header, cannot decrypt]"
+                else:
+                    try:
+                        key_bytes, _ = km_adapter.get_key(key_id=key_id)
+                        plaintext_bytes = crypto.decrypt_payload(
+                            body_raw_bytes,
+                            {"level": security_level, "key_id": key_id, "nonce": nonce_b64},
+                            key_material=key_bytes,
+                        )
+                        body = plaintext_bytes.decode("utf-8", errors="replace")
+                    except KeyError:
+                        body = "[Could not decrypt: key not found in local key bank]"
+                    except ValueError as e:
+                        body = f"[Could not decrypt message: {e}]"
+                    except NotImplementedError:
+                        body = f"[Level {security_level} decryption not implemented yet]"
 
             results.append(
                 EmailMessage(

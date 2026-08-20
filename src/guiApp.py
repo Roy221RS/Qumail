@@ -263,6 +263,7 @@ class QuMailApp(ctk.CTk):
                 body=body,
                 attachment_paths=attachment_paths,
                 security_level=level,
+                km_adapter=self.km_adapter,
             )
             self.send_queue.put(("ok", None))
         except Exception as e:  # noqa: BLE001 - surface any failure to the UI
@@ -283,6 +284,7 @@ class QuMailApp(ctk.CTk):
                 self.body_text.delete("1.0", "end")
                 self.attachment_paths = []
                 self.attachment_label.configure(text="No files attached")
+                self._refresh_key_bank_widget()  # L2/L3 sends consume a key
             else:
                 self.send_status_label.configure(text="Send failed", text_color="red")
                 messagebox.showerror("Send failed", payload)
@@ -359,7 +361,9 @@ class QuMailApp(ctk.CTk):
     def _fetch_worker(self):
         """Runs on a background thread. Never touch widgets here."""
         try:
-            messages = fetch_inbox(self.config_mgr.data, max_emails=15)
+            messages = fetch_inbox(
+                self.config_mgr.data, max_emails=15, km_adapter=self.km_adapter
+            )
             self.fetch_queue.put(("ok", messages))
         except Exception as e:  # noqa: BLE001
             self.fetch_queue.put(("error", str(e)))
@@ -377,6 +381,7 @@ class QuMailApp(ctk.CTk):
                 self.inbox_status_label.configure(
                     text=f"{len(payload)} messages", text_color="gray60"
                 )
+                self._refresh_key_bank_widget()  # decrypting L2/L3 mail also consumes a key
             else:
                 self.inbox_status_label.configure(text="Failed to load", text_color="red")
                 messagebox.showerror("Inbox fetch failed", payload)

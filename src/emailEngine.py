@@ -1,30 +1,3 @@
-"""
-email_engine.py
-
-Core protocol engine for QuMail:
-- send_email(): builds a MIME message, encrypts the body if security_level
-  > 1 (fetching a key from km_adapter), and sends over SMTP+SSL
-- fetch_inbox(): pulls recent messages over IMAP+SSL, parses headers/body,
-  and decrypts the body if the message was sent at security_level > 1
-  (fetching the matching key from km_adapter by key_id)
-
-Both functions are synchronous / blocking on purpose — the GUI layer is
-responsible for running these on a background thread (see gui_app.py) and
-must NEVER touch CTk widgets directly from that thread. Push results into
-a queue.Queue and poll it from the main thread via .after().
-
-Security metadata:
-QuMail attaches custom headers so the receiver knows how a message was
-protected and which quantum key to re-fetch from its own local KM:
-    X-QuMail-Level   -> "1" | "2" | "3"
-    X-QuMail-KeyID   -> key identifier string, or "" for Level 1
-    X-QuMail-Nonce   -> base64 AES-GCM nonce, only present for Level 2
-
-For Level 1, all of this is a no-op passthrough (headers are "1"/""/absent).
-For Level 2+, send_email requires a km_adapter to allocate a key, and
-fetch_inbox requires one to look the same key back up by ID.
-"""
-
 import smtplib
 import imaplib
 import email

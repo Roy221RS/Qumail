@@ -1,26 +1,3 @@
-"""
-crypto_adapter.py
-
-Level 1: passthrough (no encryption).
-Level 2: HKDF-derived AES-256-GCM.
-    The raw QKD key (1KB from km_adapter.py) is NOT used directly as the
-    AES key - it's run through HKDF to deterministically derive a proper
-    32-byte AES-256 key. "Deterministic" is the key property: sender and
-    receiver independently fetch the SAME raw key bytes from their own
-    local KM, run the SAME derivation, and land on the SAME AES key -
-    without ever exchanging the derived key itself.
-    AES-256-GCM also gives integrity for free: a tampered/corrupted
-    ciphertext fails the auth-tag check and raises, instead of silently
-    decrypting into garbage.
-Level 3: One-Time Pad (XOR) - not implemented yet, raises NotImplementedError.
-    Coming next: raw key bytes used directly as the pad, no derivation,
-    no reuse allowed.
-
-Key FETCHING lives in km_adapter.py - this class only does the crypto
-transform, given key bytes it's handed by the caller (email_engine.py).
-Keeps the two concerns swappable independently.
-"""
-
 import os
 import base64
 from typing import Optional, Tuple, Dict, Any
@@ -30,11 +7,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
-AES_KEY_LEN = 32          # AES-256 requires exactly a 32-byte key
-GCM_NONCE_LEN = 12        # standard/recommended nonce size for AES-GCM
-# Fixed context string for HKDF - must be identical on both sender and
-# receiver, since it's part of what determines the derived key. Not
-# secret, just needs to match.
+AES_KEY_LEN = 32
+GCM_NONCE_LEN = 12
 HKDF_INFO_L2 = b"qumail-level2-aes-gcm"
 
 
@@ -73,7 +47,21 @@ class CryptoAdapter:
                 "nonce": base64.b64encode(nonce).decode("ascii"),
             }
 
-        # Level 3 (OTP/XOR) - next up, not yet implemented.
+        if level == 3:
+            if not key_material:
+                raise ValueError("Level 3 encryption requires key_material from the KM.")
+            if len(payload_bytes) > len(key_material):
+                raise ValueError(
+                    f"Message ({len(payload_bytes)} bytes) exceeds available key "
+                    f"material ({len(key_material)} bytes) for Level 3 OTP. "
+                    "Shorten the message or use Level 2 instead."
+                )
+            # Raw XOR - no derivation. OTP security requires the pad be
+            # used exactly as-is: truly random, at least as long as the
+            # message, and never reused (km_adapter marks it used on fetch).
+            ciphertext = bytes(p ^ k for p, k in zip(payload_bytes, key_material))
+            return ciphertext, {"level": 3, "key_id": key_id}
+
         raise NotImplementedError(f"Security level {level} not implemented yet.")
 
     def decrypt_payload(
@@ -102,5 +90,15 @@ class CryptoAdapter:
                 raise ValueError(
                     "Decryption failed: wrong key or tampered/corrupted message."
                 ) from e
+
+        if level == 3:
+            if not key_material:
+                raise ValueError("Level 3 decryption requires key_material from the KM.")
+            if len(processed_bytes) > len(key_material):
+                raise ValueError(
+                    f"Ciphertext ({len(processed_bytes)} bytes) exceeds available key "
+                    f"material ({len(key_material)} bytes) - cannot be valid OTP data."
+                )
+            return bytes(c ^ k for c, k in zip(processed_bytes, key_material))
 
         raise NotImplementedError(f"Security level {level} not implemented yet.")

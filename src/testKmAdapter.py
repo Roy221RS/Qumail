@@ -1,16 +1,3 @@
-"""
-test_km_adapter.py
-
-Standalone manual test for km_adapter.py - run this yourself to verify the
-mock Key Manager actually works before trusting it in the GUI.
-
-Run from inside src/:
-    python test_km_adapter.py
-
-This does NOT touch your real key_bank.json (it uses temp files), so it's
-safe to run repeatedly without messing up your app's actual key state.
-"""
-
 import os
 from kmAdapter import MockKMAdapter, NUM_KEYS, KEY_SIZE_BYTES
 

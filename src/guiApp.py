@@ -1,30 +1,3 @@
-"""
-gui_app.py
-
-QuMail's main window and all views (Compose, Inbox, Settings), built with
-CustomTkinter for the modern chrome (sidebar, buttons, entries) plus a
-plain ttk.Treeview for the inbox table - CTk has no native table/list
-widget, and hand-rolling rows in a CTkScrollableFrame is slower to build
-and worse-looking than just theming a Treeview to match dark mode.
-
---- THREADING MODEL (read this before touching send/fetch code) ---
-CustomTkinter (like all Tkinter) is NOT thread-safe: you must never touch
-a CTk/tk widget from any thread other than the main GUI thread, or you'll
-get random crashes/freezes (this is a classic Tkinter footgun).
-
-The pattern used everywhere in this file:
-  1. User clicks a button (Send, Refresh) on the main thread.
-  2. We spawn a `threading.Thread` that does ONLY blocking I/O
-     (send_email / fetch_inbox) - no widget access inside the thread.
-  3. The thread's result (or exception) is put onto a `queue.Queue`.
-  4. The main thread polls that queue every 100ms via `self.after(100, fn)`
-     (`.after` always runs on the main thread, so it's safe to update
-     widgets there).
-
-This keeps the GUI responsive during network calls without ever crossing
-the thread-safety boundary.
-"""
-
 import os
 import threading
 import queue
